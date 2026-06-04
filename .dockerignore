@@ -1,0 +1,13 @@
+.venv/
+.git/
+__pycache__/
+**/__pycache__/
+*.pyc
+snapshots/
+dashboards/
+manifests/
+terminals/
+*.json
+!requirements.txt
+.env
+.env.*
