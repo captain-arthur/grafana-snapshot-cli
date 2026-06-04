@@ -50,3 +50,4 @@ python cli/snapshot_publish.py export -u snapshot-demo -n my-run -o .
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
+# grafana-snapshot-cli
