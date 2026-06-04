@@ -8,6 +8,6 @@ dashboards/
 manifests/
 terminals/
 *.json
-!requirements.txt
+reports/
 .env
 .env.*

@@ -7,8 +7,8 @@ import base64
 import json
 import os
 import ssl
-import sys
 import urllib.error
+import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Iterator
@@ -48,6 +48,7 @@ class ExportResult(BaseModel):
     key: str
     file: str
     name: str
+    skipped: bool = False
 
 
 class ImportEntry(BaseModel):
@@ -59,7 +60,9 @@ class ImportEntry(BaseModel):
 
 class ImportReport(BaseModel):
     imported: int
+    skipped: int
     snapshots: list[ImportEntry]
+    skipped_names: list[str]
 
 
 class GrafanaApi:
@@ -93,6 +96,17 @@ class GrafanaApi:
             self.call(f"/api/snapshots/{key}", method="DELETE")
         except Exception:
             pass
+
+    def list_snapshots(self, query: str) -> list[dict[str, Any]]:
+        q = urllib.parse.quote(query, safe="")
+        result = self.call(f"/api/dashboard/snapshots?query={q}")
+        return result if isinstance(result, list) else []
+
+    def find_by_name(self, name: str) -> dict[str, Any] | None:
+        for snap in self.list_snapshots(name):
+            if snap.get("name") == name and snap.get("key"):
+                return snap
+        return None
 
     def create(self, dashboard: dict[str, Any], name: str) -> dict[str, Any]:
         return self.call(
@@ -130,6 +144,17 @@ class SnapshotService:
         out_path = _write_json(snapshot, output_dir / f"{name}.json")
         self._api.delete(key)
 
+        existing = self._api.find_by_name(name)
+        if existing:
+            saved_key = existing["key"]
+            return ExportResult(
+                url=existing.get("url", f"{self._cfg.url}/dashboard/snapshot/{saved_key}"),
+                key=saved_key,
+                file=str(out_path),
+                name=name,
+                skipped=True,
+            )
+
         saved = self._api.create(snapshot, name)
         saved_key = saved.get("key")
         if not saved_key:
@@ -150,9 +175,13 @@ class SnapshotService:
             raise RuntimeError(f"no *.json files in {directory}")
 
         entries: list[ImportEntry] = []
+        skipped_names: list[str] = []
         for path in paths:
             dashboard = json.loads(path.read_text(encoding="utf-8"))
             snap_name = dashboard.get("title") or path.stem
+            if self._api.find_by_name(snap_name):
+                skipped_names.append(snap_name)
+                continue
             created = self._api.create(dashboard, snap_name)
             key = created.get("key")
             if not key:
@@ -165,7 +194,12 @@ class SnapshotService:
                     url=created.get("url", f"{self._cfg.url}/dashboard/snapshot/{key}"),
                 )
             )
-        return ImportReport(imported=len(entries), snapshots=entries)
+        return ImportReport(
+            imported=len(entries),
+            skipped=len(skipped_names),
+            snapshots=entries,
+            skipped_names=skipped_names,
+        )
 
     def _capture_via_browser(self, dashboard_url: str) -> dict[str, Any]:
         with sync_playwright() as pw:
@@ -339,46 +373,64 @@ def _write_json(data: dict[str, Any], path: Path) -> Path:
     return path
 
 
-def main(argv: list[str] | None = None) -> None:
-    parser = argparse.ArgumentParser(prog="grafana-snapshots")
-    parser.add_argument(
-        "-V",
-        "--version",
-        action="version",
-        version=f"grafana-snapshots {__version__}",
-    )
-    sub = parser.add_subparsers(dest="command", required=True)
+parser = argparse.ArgumentParser(prog="grafana-snapshots")
+parser.add_argument(
+    "-V",
+    "--version",
+    action="version",
+    version=f"grafana-snapshots {__version__}",
+)
+_sub = parser.add_subparsers(required=True)
 
-    export_p = sub.add_parser("export")
-    export_p.add_argument("-u", "--uid", required=True)
-    export_p.add_argument("-n", "--name", required=True)
-    export_p.add_argument("-f", "--from", dest="time_from", required=True)
-    export_p.add_argument("-t", "--to", dest="time_to", required=True)
-    export_p.add_argument("-o", "--output", default=".")
+_export = _sub.add_parser("export")
+_export.set_defaults(snap_export=True, snap_import=False)
+_export.add_argument("-u", "--uid", required=True)
+_export.add_argument("-n", "--name", required=True)
+_export.add_argument("-f", "--from", dest="time_from", required=True)
+_export.add_argument("-t", "--to", dest="time_to", required=True)
+_export.add_argument("-o", "--output", default=".")
 
-    import_p = sub.add_parser("import")
-    import_p.add_argument("-d", "--dir", required=True)
+_import = _sub.add_parser("import")
+_import.set_defaults(snap_export=False, snap_import=True)
+_import.add_argument("-d", "--dir", required=True)
 
-    args = parser.parse_args(argv)
+
+FLAG = f"""
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣤⣤⣤⣀⠀⠀⠀⠀⠀⠀⠀⣀⡀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣔⠉⣠⣿⣿⣿⠿⢿⣦⡀⠀⠀⠸⣿⣿⣥⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⢀⣴⣿⣿⣿⣿⣿⣿⣷⣀⣀⣿⣿⣦⡀⠀⠙⠃⠉⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⡔⠁⣿⣿⣿⡟⠉⢉⣻⣿⣿⣿⣿⣿⣿⡿⢆⠀⠀⠀⠀ "Just a moment, please..!"⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⢷⣿⣿⣿⠟⠛⠋⠉⠉⠉⠙⠛⠿⣿⣿⡀⡸⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠈⠛⠿⡇⣠⠈⠓⢢⣦⡆⠚⠀⡄⢹⠿⠋⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⢾⣷⣴⣄⠀⢰⠀⠀⠀⠀⠘⠛⠀⠀⠀⠀⠈⡄⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠸⣿⢿⣯⠁⠀⠘⡀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠈⠉⠀⠀⠀⠘⠠⣀⡀⠀⠀⠀⣀⡠⠔⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
+
+"""
+
+
+def main() -> None:
+    print(FLAG)
+
+    args = parser.parse_args()
     cfg = GrafanaConfig.from_env()
     svc = SnapshotService(cfg)
 
-    try:
-        if args.command == "export":
-            result = svc.export(
-                args.uid,
-                args.name,
-                Path(args.output).expanduser().resolve(),
-                args.time_from,
-                args.time_to,
-            )
-            print(result.model_dump_json())
-        else:
-            report = svc.import_dir(Path(args.dir).expanduser().resolve())
-            print(report.model_dump_json())
-    except Exception as exc:
-        print(str(exc), file=sys.stderr)
-        sys.exit(1)
+    if args.snap_export:
+        result = svc.export(
+            args.uid,
+            args.name,
+            Path(args.output).expanduser().resolve(),
+            args.time_from,
+            args.time_to,
+        )
+        print(result.model_dump_json())
+
+    if args.snap_import:
+        report = svc.import_dir(Path(args.dir).expanduser().resolve())
+        print(report.model_dump_json())
 
 
 if __name__ == "__main__":

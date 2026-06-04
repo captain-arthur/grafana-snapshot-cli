@@ -4,11 +4,12 @@ ENV LANG=C.UTF-8
 ENV LC_ALL=C.UTF-8
 
 WORKDIR /app
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt \
-    && python -m playwright install chromium
+COPY pyproject.toml uv.lock README.md ./
+COPY cli/ ./cli/
+RUN pip install --no-cache-dir uv \
+    && uv sync --frozen --no-dev \
+    && uv run playwright install chromium
 
-COPY cli/snapshot_publish.py snapshot_publish.py
-
+ENV PATH="/app/.venv/bin:${PATH}"
 WORKDIR /reports
-ENTRYPOINT ["python", "/app/snapshot_publish.py"]
+ENTRYPOINT ["grafana-snapshots"]
