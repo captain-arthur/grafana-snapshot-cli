@@ -46,7 +46,14 @@ class GrafanaApi:
 
     def get_snapshot(self, name: str) -> Snapshot | None:
         url = f"{config.GRAFANA_URL}/api/dashboard/snapshots"
-        items = requests.get(url, params={"query": name}, auth=self.auth, verify=self.verify, timeout=self.timeout).json()
+        response = requests.get(
+            url, params={"query": name}, auth=self.auth, verify=self.verify, timeout=self.timeout
+        )
+        if response.status_code == 401:
+            raise RuntimeError("grafana authentication failed: invalid username or password")
+        items = response.json()
+        if not isinstance(items, list):
+            raise RuntimeError(f"unexpected snapshots list response: {items}")
         for item in items:
             if item.get("name") == name:
                 key = item.get("key", "")
