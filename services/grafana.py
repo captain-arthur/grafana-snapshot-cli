@@ -11,7 +11,7 @@ from cli import config
 urllib3.disable_warnings()
 
 VERIFY_SSL = False
-TIMEOUT = 120
+TIMEOUT = 60
 
 
 class Snapshot(BaseModel):

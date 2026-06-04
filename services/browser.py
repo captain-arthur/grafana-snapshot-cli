@@ -7,13 +7,15 @@ from playwright.sync_api import BrowserContext, Page, TimeoutError as Playwright
 from cli import config
 from services.grafana import Snapshot
 
-PANEL_WAIT_MS = 90_000
-PAGE_TIMEOUT_MS = 120_000
-CLICK_TIMEOUT_MS = 20_000
-ROW_EXPAND_WAIT_MS = 1_000
-ROW_EXPAND_MAX_ROUNDS = 24
+PANEL_WAIT_MS = 35_000
+PAGE_TIMEOUT_MS = 20_000
+DASHBOARD_LOADING_MS = 8_000
+ROWS_READY_MS = 8_000
+CLICK_TIMEOUT_MS = 10_000
+ROW_EXPAND_WAIT_MS = 300
+ROW_EXPAND_MAX_ROUNDS = 12
 SCROLL_STEP_PIXELS = 400
-SCROLL_STEP_DELAY_MS = 120
+SCROLL_STEP_DELAY_MS = 80
 VIEWPORT = {"width": 1920, "height": 1080}
 BROWSER_ARGS = ["--no-sandbox", "--disable-dev-shm-usage"]
 
@@ -54,7 +56,7 @@ def _login(context: BrowserContext) -> None:
 
 def _wait_dashboard_ready(page: Page) -> None:
     try:
-        page.get_by_label("Loading Grafana").wait_for(state="hidden", timeout=PAGE_TIMEOUT_MS)
+        page.get_by_label("Loading Grafana").wait_for(state="hidden", timeout=DASHBOARD_LOADING_MS)
     except PlaywrightTimeoutError:
         pass
 
@@ -67,7 +69,7 @@ def _wait_rows_ready(page: Page) -> None:
                 'button[aria-label="Expand row"], button[aria-label="Collapse row"]'
               ).length > 0
               || document.querySelector('[data-testid*="panel"]') !== null""",
-            timeout=PAGE_TIMEOUT_MS,
+            timeout=ROWS_READY_MS,
         )
     except PlaywrightTimeoutError:
         pass
