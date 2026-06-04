@@ -30,7 +30,7 @@ class ExportParams(BaseModel):
     @property
     def dashboard_url(self) -> str:
         return (
-            f"{config.GRAFANA_URL}/d/{config.DASHBOARD_UID}/"
+            f"{config.GRAFANA_URL}/d/{config.GRAFANA_DASHBOARD_UID}/"
             f"?from={self.time_from}&to={self.time_to}"
         )
 
