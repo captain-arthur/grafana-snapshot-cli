@@ -1,279 +1,381 @@
 #!/usr/bin/env python3
-"""Grafana 12.3 — manual snapshot export (browser) and import (API)."""
+"""Grafana 12 — snapshot export (browser) and import (API)."""
 from __future__ import annotations
 
 import argparse
 import base64
 import json
 import os
+import ssl
 import sys
 import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from playwright.sync_api import Page, sync_playwright
-from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+from pydantic import BaseModel, field_validator
+from playwright.sync_api import Page, TimeoutError as PlaywrightTimeoutError, sync_playwright
 
-QUERY_WAIT_MS = int(os.environ.get("SNAPSHOT_QUERY_WAIT_MS", "30000"))
-VIEWPORT = {"width": 1920, "height": 2400}
+__version__ = "0.1.0"
 
-
-def export_snapshot(
-    uid: str,
-    name: str,
-    output_dir: str,
-    *,
-    time_from: str = "now-1h",
-    time_to: str = "now",
-    base_url: str,
-    user: str,
-    password: str,
-) -> dict[str, Any]:
-    output_file = os.path.join(output_dir, f"{name}.json")
-    url = f"{base_url}/d/{uid}/?from={time_from}&to={time_to}"
-
-    published = _capture_via_browser(base_url, user, password, url)
-    key = published.get("key")
-    if not key:
-        raise RuntimeError(f"snapshot publish returned no key: {published}")
-
-    snapshot = _fetch_snapshot(base_url, user, password, key)
-    if not _has_embedded_data(snapshot):
-        _delete_snapshot(base_url, user, password, key)
-        raise RuntimeError("empty snapshot — no embedded metric data (No data)")
-
-    snapshot["title"] = name
-    out_path = _save_json(snapshot, output_file)
-    _delete_snapshot(base_url, user, password, key)
-    saved = _create_snapshot(base_url, user, password, snapshot, name)
-    key = saved.get("key")
-    if not key:
-        raise RuntimeError(f"snapshot save failed: {saved}")
-
-    return {
-        "url": saved.get("url", f"{base_url}/dashboard/snapshot/{key}"),
-        "key": key,
-        "file": out_path,
-        "name": name,
-    }
+PANEL_WAIT_MS = 30_000
+VIEWPORT = {"width": 1920, "height": 1080}
 
 
-def import_snapshots(directory: str, *, base_url: str, user: str, password: str) -> list[dict[str, Any]]:
-    root = Path(directory).expanduser().resolve()
-    if not root.is_dir():
-        raise RuntimeError(f"not a directory: {root}")
+class GrafanaConfig(BaseModel):
+    url: str
+    user: str
+    password: str
 
-    paths = sorted(root.glob("*.json"))
-    if not paths:
-        raise RuntimeError(f"no *.json files in {root}")
+    @field_validator("url")
+    @classmethod
+    def no_trailing_slash(cls, value: str) -> str:
+        return value.rstrip("/")
 
-    results: list[dict[str, Any]] = []
-    for path in paths:
-        with open(path, encoding="utf-8") as fh:
-            dashboard = json.load(fh)
-        snap_name = dashboard.get("title") or path.stem
-        created = _create_snapshot(base_url, user, password, dashboard, snap_name)
-        key = created.get("key")
-        if not key:
-            raise RuntimeError(f"import failed for {path.name}: {created}")
-        results.append(
-            {
-                "file": str(path),
-                "name": snap_name,
-                "key": key,
-                "url": created.get("url", f"{base_url}/dashboard/snapshot/{key}"),
-            }
+    @classmethod
+    def from_env(cls) -> GrafanaConfig:
+        fields = {}
+        for key in ("GRAFANA_URL", "GRAFANA_USER", "GRAFANA_PASSWORD"):
+            value = os.environ.get(key, "").strip()
+            if not value:
+                raise RuntimeError(f"{key} is required")
+            fields[key.removeprefix("GRAFANA_").lower()] = value
+        return cls(**fields)
+
+
+class ExportResult(BaseModel):
+    url: str
+    key: str
+    file: str
+    name: str
+
+
+class ImportEntry(BaseModel):
+    file: str
+    name: str
+    key: str
+    url: str
+
+
+class ImportReport(BaseModel):
+    imported: int
+    snapshots: list[ImportEntry]
+
+
+class GrafanaApi:
+    def __init__(self, cfg: GrafanaConfig) -> None:
+        self._cfg = cfg
+        self._ssl = ssl._create_unverified_context() if cfg.url.startswith("https://") else None
+
+    def call(self, path: str, method: str = "GET", body: dict[str, Any] | None = None) -> dict[str, Any]:
+        auth = base64.b64encode(f"{self._cfg.user}:{self._cfg.password}".encode()).decode()
+        payload = json.dumps(body).encode() if body is not None else None
+        headers = {"Authorization": f"Basic {auth}"}
+        if payload is not None:
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(
+            f"{self._cfg.url}{path}", data=payload, headers=headers, method=method
         )
-    return results
-
-
-def _capture_via_browser(base_url: str, user: str, password: str, dashboard_url: str) -> dict[str, Any]:
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=True)
         try:
-            ctx = browser.new_context(viewport=VIEWPORT, ignore_https_errors=True)
-            login = ctx.request.post(
-                f"{base_url}/login",
-                data=json.dumps({"user": user, "password": password}),
-                headers={"Content-Type": "application/json"},
-            )
-            if login.status >= 400:
-                raise RuntimeError(f"login failed: {login.status}")
+            with urllib.request.urlopen(req, timeout=60, context=self._ssl) as resp:
+                raw = resp.read()
+                return json.loads(raw) if raw else {}
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode(errors="replace")
+            raise RuntimeError(f"{method} {path} failed ({exc.code}): {detail}") from exc
 
-            page = ctx.new_page()
-            page.goto(dashboard_url, wait_until="networkidle", timeout=60_000)
-            if "/login" in page.url:
-                raise RuntimeError("session expired")
+    def fetch_dashboard(self, key: str) -> dict[str, Any]:
+        body = self.call(f"/api/snapshots/{key}")
+        return body.get("dashboard") or body
 
-            _expand_collapsed_rows(page)
-            _wait_for_panels_loaded(page)
-            return _publish_via_ui(page)
-        finally:
-            browser.close()
+    def delete(self, key: str) -> None:
+        try:
+            self.call(f"/api/snapshots/{key}", method="DELETE")
+        except Exception:
+            pass
 
-
-def _expand_collapsed_rows(page: Page) -> None:
-    toggles = page.locator(".dashboard-container [aria-expanded='false']")
-    for i in range(toggles.count()):
-        toggles.nth(i).click(timeout=5000)
-
-
-def _wait_for_panels_loaded(page: Page) -> None:
-    try:
-        page.wait_for_function(
-            """() => {
-                const sels = ['.panel-loading', '[aria-label="Panel loading bar"]'];
-                return sels.every(s => document.querySelectorAll(s).length === 0);
-            }""",
-            timeout=QUERY_WAIT_MS,
+    def create(self, dashboard: dict[str, Any], name: str) -> dict[str, Any]:
+        return self.call(
+            "/api/snapshots",
+            method="POST",
+            body={"dashboard": dashboard, "name": name, "expires": 0},
         )
-    except PlaywrightTimeoutError as exc:
-        raise RuntimeError(
-            f"panels still loading after {QUERY_WAIT_MS // 1000}s"
-        ) from exc
 
 
-def _publish_via_ui(page: Page) -> dict[str, Any]:
-    page.get_by_role("button", name="Share").click(timeout=8000)
-    page.get_by_role("menuitem", name="Share snapshot").click(timeout=8000)
+class SnapshotService:
+    def __init__(self, cfg: GrafanaConfig) -> None:
+        self._cfg = cfg
+        self._api = GrafanaApi(cfg)
 
-    def is_snapshot_post(resp):
-        return "/api/snapshots" in resp.url and resp.request.method == "POST"
+    def export(
+        self, uid: str, name: str, output_dir: Path, time_from: str, time_to: str
+    ) -> ExportResult:
+        dashboard_url = f"{self._cfg.url}/d/{uid}/?from={time_from}&to={time_to}"
+        published = self._capture_via_browser(dashboard_url)
+        key = published.get("key")
+        if not key:
+            raise RuntimeError(f"snapshot publish returned no key: {published}")
 
-    with page.expect_response(is_snapshot_post, timeout=60_000) as pending:
-        page.get_by_role("button", name="Publish snapshot").click(timeout=8000)
-    return pending.value.json()
+        snapshot = self._api.fetch_dashboard(key)
+        missing = _panels_missing_snapshot(snapshot)
+        if missing:
+            self._api.delete(key)
+            titles = ", ".join(missing[:8])
+            suffix = f" (+{len(missing) - 8} more)" if len(missing) > 8 else ""
+            raise RuntimeError(
+                f"snapshot missing metric data for panels: {titles}{suffix}"
+            )
+
+        snapshot["title"] = name
+        out_path = _write_json(snapshot, output_dir / f"{name}.json")
+        self._api.delete(key)
+
+        saved = self._api.create(snapshot, name)
+        saved_key = saved.get("key")
+        if not saved_key:
+            raise RuntimeError(f"snapshot save failed: {saved}")
+
+        return ExportResult(
+            url=saved.get("url", f"{self._cfg.url}/dashboard/snapshot/{saved_key}"),
+            key=saved_key,
+            file=str(out_path),
+            name=name,
+        )
+
+    def import_dir(self, directory: Path) -> ImportReport:
+        if not directory.is_dir():
+            raise RuntimeError(f"not a directory: {directory}")
+        paths = sorted(directory.glob("*.json"))
+        if not paths:
+            raise RuntimeError(f"no *.json files in {directory}")
+
+        entries: list[ImportEntry] = []
+        for path in paths:
+            dashboard = json.loads(path.read_text(encoding="utf-8"))
+            snap_name = dashboard.get("title") or path.stem
+            created = self._api.create(dashboard, snap_name)
+            key = created.get("key")
+            if not key:
+                raise RuntimeError(f"import failed for {path.name}: {created}")
+            entries.append(
+                ImportEntry(
+                    file=str(path),
+                    name=snap_name,
+                    key=key,
+                    url=created.get("url", f"{self._cfg.url}/dashboard/snapshot/{key}"),
+                )
+            )
+        return ImportReport(imported=len(entries), snapshots=entries)
+
+    def _capture_via_browser(self, dashboard_url: str) -> dict[str, Any]:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
+            )
+            try:
+                ctx = browser.new_context(
+                    viewport=VIEWPORT,
+                    ignore_https_errors=True,
+                    locale="en-US",
+                )
+                login = ctx.request.post(
+                    f"{self._cfg.url}/login",
+                    data=json.dumps({"user": self._cfg.user, "password": self._cfg.password}),
+                    headers={"Content-Type": "application/json"},
+                )
+                if login.status >= 400:
+                    raise RuntimeError(f"login failed: {login.status}")
+
+                page = ctx.new_page()
+                page.goto(dashboard_url, wait_until="domcontentloaded", timeout=60_000)
+                if "/login" in page.url:
+                    raise RuntimeError("session expired")
+
+                _wait_dashboard_ready(page)
+                _wait_rows_ready(page)
+                _expand_rows(page)
+                _scroll_dashboard(page)
+                _wait_panels(page)
+                return _publish_snapshot(page)
+            finally:
+                browser.close()
 
 
-def _has_embedded_data(dashboard: dict[str, Any]) -> bool:
-    """True if at least one query target has non-empty snapshot series."""
-    for panel in _iter_panels(dashboard.get("panels") or []):
-        for target in panel.get("targets") or []:
-            if target.get("hide"):
-                continue
-            snap = target.get("snapshot")
-            if not isinstance(snap, list):
-                continue
-            for frame in snap:
-                values = (frame.get("data") or {}).get("values") or []
-                if any(isinstance(col, list) and len(col) > 0 for col in values):
-                    return True
-    return False
-
-
-def _iter_panels(panels: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    out: list[dict[str, Any]] = []
-    for p in panels:
-        if p.get("type") == "row":
-            out.extend(_iter_panels(p.get("panels") or []))
-        else:
-            out.append(p)
-    return out
-
-
-def _api_request(
-    base_url: str,
-    user: str,
-    password: str,
-    path: str,
-    method: str = "GET",
-    body: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    auth = base64.b64encode(f"{user}:{password}".encode()).decode()
-    data = json.dumps(body).encode() if body is not None else None
-    headers = {"Authorization": f"Basic {auth}"}
-    if data is not None:
-        headers["Content-Type"] = "application/json"
-    req = urllib.request.Request(f"{base_url}{path}", data=data, headers=headers, method=method)
+def _wait_dashboard_ready(page: Page) -> None:
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            raw = resp.read()
-            return json.loads(raw) if raw else {}
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode(errors="replace")
-        raise RuntimeError(f"{method} {path} failed ({exc.code}): {detail}") from exc
-
-
-def _fetch_snapshot(base_url: str, user: str, password: str, key: str) -> dict[str, Any]:
-    body = _api_request(base_url, user, password, f"/api/snapshots/{key}")
-    return body.get("dashboard") or body
-
-
-def _delete_snapshot(base_url: str, user: str, password: str, key: str) -> None:
-    try:
-        _api_request(base_url, user, password, f"/api/snapshots/{key}", method="DELETE")
-    except Exception:
+        page.get_by_label("Loading Grafana").wait_for(state="hidden", timeout=60_000)
+    except PlaywrightTimeoutError:
         pass
 
 
-def _create_snapshot(
-    base_url: str, user: str, password: str, dashboard: dict[str, Any], name: str
-) -> dict[str, Any]:
-    return _api_request(
-        base_url,
-        user,
-        password,
-        "/api/snapshots",
-        method="POST",
-        body={"dashboard": dashboard, "name": name, "expires": 0},
+def _wait_rows_ready(page: Page) -> None:
+    """Row headers render after the global loading overlay disappears."""
+    try:
+        page.wait_for_function(
+            """() =>
+              document.querySelectorAll(
+                'button[aria-label="Expand row"], button[aria-label="Collapse row"]'
+              ).length > 0
+              || document.querySelector('[data-testid*="panel"]') !== null""",
+            timeout=60_000,
+        )
+    except PlaywrightTimeoutError:
+        pass
+
+
+def _expand_rows(page: Page) -> None:
+    """Expand collapsed dashboard rows so hidden panels load and snapshot."""
+    for _ in range(16):
+        expand = page.get_by_role("button", name="Expand row")
+        count = expand.count()
+        if count == 0:
+            break
+        for i in range(count):
+            try:
+                btn = expand.nth(i)
+                btn.scroll_into_view_if_needed(timeout=5_000)
+                btn.click(timeout=5_000)
+            except PlaywrightTimeoutError:
+                pass
+        page.wait_for_timeout(400)
+
+
+def _scroll_dashboard(page: Page) -> None:
+    page.evaluate(
+        """async () => {
+          const el = document.querySelector('[data-testid="page-content"]')
+            || document.querySelector('.dashboard-container');
+          if (!el) return;
+          const step = 400;
+          for (let y = 0; y <= el.scrollHeight; y += step) {
+            el.scrollTop = y;
+            await new Promise((r) => setTimeout(r, 60));
+          }
+          el.scrollTop = 0;
+        }"""
     )
 
 
-def _save_json(snapshot: dict[str, Any], path: str) -> str:
-    path = os.path.abspath(path)
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-    with open(path, "w", encoding="utf-8") as fh:
-        json.dump(snapshot, fh, ensure_ascii=False, indent=2)
+def _wait_panels(page: Page) -> None:
+    try:
+        page.wait_for_function(
+            """() => ['.panel-loading', '[aria-label="Panel loading bar"]']
+                .every(s => document.querySelectorAll(s).length === 0)""",
+            timeout=PANEL_WAIT_MS,
+        )
+    except PlaywrightTimeoutError as exc:
+        raise RuntimeError(f"panels still loading after {PANEL_WAIT_MS // 1000}s") from exc
+
+
+def _publish_snapshot(page: Page) -> dict[str, Any]:
+    page.keyboard.press("Escape")
+    page.evaluate(
+        """() => {
+          window.scrollTo(0, 0);
+          const el = document.querySelector('[data-testid="page-content"]')
+            || document.querySelector('.dashboard-container');
+          if (el) el.scrollTop = 0;
+        }"""
+    )
+    share = page.get_by_role("button", name="Share").last
+    share.wait_for(state="visible", timeout=PANEL_WAIT_MS)
+    share.click(timeout=8_000)
+    page.get_by_role("menuitem", name="Share snapshot").click(timeout=8_000)
+
+    def is_post(resp) -> bool:
+        return "/api/snapshots" in resp.url and resp.request.method == "POST"
+
+    with page.expect_response(is_post, timeout=60_000) as pending:
+        page.get_by_role("button", name="Publish snapshot").click(timeout=8_000)
+    return pending.value.json()
+
+
+def _iter_panels(panels: list[dict[str, Any]]) -> Iterator[dict[str, Any]]:
+    for panel in panels:
+        if panel.get("type") == "row":
+            yield from _iter_panels(panel.get("panels") or [])
+        else:
+            yield panel
+
+
+def _target_has_snapshot_data(target: dict[str, Any]) -> bool:
+    snap = target.get("snapshot")
+    if not isinstance(snap, list):
+        return False
+    for frame in snap:
+        values = (frame.get("data") or {}).get("values") or []
+        if any(isinstance(col, list) and col for col in values):
+            return True
+    return False
+
+
+def _panels_missing_snapshot(dashboard: dict[str, Any]) -> list[str]:
+    missing: list[str] = []
+    for panel in _iter_panels(dashboard.get("panels") or []):
+        if panel.get("type") == "row":
+            continue
+        targets = panel.get("targets") or []
+        if not targets:
+            continue
+        label = str(panel.get("title") or panel.get("id") or "unknown")
+        for target in targets:
+            if target.get("hide"):
+                continue
+            if _target_has_snapshot_data(target):
+                continue
+            if target.get("queryType") == "snapshot" or target.get("expr") or target.get(
+                "datasource"
+            ):
+                missing.append(label)
+                break
+    return missing
+
+
+def _write_json(data: dict[str, Any], path: Path) -> Path:
+    path = path.resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     return path
-
-
-def _env(name: str, default: str) -> str:
-    return os.environ.get(name, default)
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(prog="grafana-snapshots")
+    parser.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version=f"grafana-snapshots {__version__}",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
     export_p = sub.add_parser("export")
-    export_p.add_argument("-u", "--uid", required=True, help="dashboard uid")
-    export_p.add_argument("-n", "--name", required=True, help="snapshot name")
-    export_p.add_argument("-f", "--from", dest="time_from", default="now-1h")
-    export_p.add_argument("-t", "--to", dest="time_to", default="now")
-    export_p.add_argument("-o", "--output", default=".", help="output directory")
+    export_p.add_argument("-u", "--uid", required=True)
+    export_p.add_argument("-n", "--name", required=True)
+    export_p.add_argument("-f", "--from", dest="time_from", required=True)
+    export_p.add_argument("-t", "--to", dest="time_to", required=True)
+    export_p.add_argument("-o", "--output", default=".")
 
     import_p = sub.add_parser("import")
-    import_p.add_argument("-d", "--dir", required=True, help="directory of *.json files")
+    import_p.add_argument("-d", "--dir", required=True)
 
     args = parser.parse_args(argv)
-    base_url = _env("GRAFANA_URL", "http://localhost:3000").rstrip("/")
-    user = _env("GRAFANA_USER", "admin")
-    password = _env("GRAFANA_PASSWORD", "admin")
+    cfg = GrafanaConfig.from_env()
+    svc = SnapshotService(cfg)
 
     try:
         if args.command == "export":
-            result = export_snapshot(
+            result = svc.export(
                 args.uid,
                 args.name,
-                str(Path(args.output).expanduser().resolve()),
-                time_from=args.time_from,
-                time_to=args.time_to,
-                base_url=base_url,
-                user=user,
-                password=password,
+                Path(args.output).expanduser().resolve(),
+                args.time_from,
+                args.time_to,
             )
-            print(json.dumps(result))
+            print(result.model_dump_json())
         else:
-            results = import_snapshots(
-                str(Path(args.dir).expanduser().resolve()),
-                base_url=base_url,
-                user=user,
-                password=password,
-            )
-            print(json.dumps({"imported": len(results), "snapshots": results}))
+            report = svc.import_dir(Path(args.dir).expanduser().resolve())
+            print(report.model_dump_json())
     except Exception as exc:
         print(str(exc), file=sys.stderr)
         sys.exit(1)

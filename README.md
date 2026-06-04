@@ -1,53 +1,57 @@
 # grafana-snapshot-cli
 
-Manual CLI to export Grafana 12 dashboard snapshots (metrics embedded in JSON) and import them back.
+Export Grafana 12 dashboard snapshots (metrics embedded in JSON) and import them back.
 
-## Quick start (Docker)
+## 1. Build image
 
 ```bash
-docker compose build
+cd ~/Documents/github/grafana-snapshot-cli
+docker build -t grafana-snapshots:v0.1.0 .
+```
 
-export GRAFANA_REPORTS_DIR=~/path/to/grafana_reports
-alias grafana-snapshots='docker compose -f /path/to/grafana-snapshot-cli/docker-compose.yaml run --rm snapshot'
+## 2. Configure `docker-compose.yaml`
 
-# After a load test — capture dashboard for the chosen time range
+Edit `environment` and the volume if needed:
+
+```yaml
+environment:
+  GRAFANA_URL: https://your-grafana.example.com
+  GRAFANA_USER: admin
+  GRAFANA_PASSWORD: secret
+volumes:
+  - ./reports:/reports
+```
+
+## 3. Alias
+
+```bash
+alias grafana-snapshots='docker compose -f ~/Documents/github/grafana-snapshot-cli/docker-compose.yaml run --rm grafana-snapshots'
+```
+
+## 4. Run
+
+```bash
+grafana-snapshots --version
+
 grafana-snapshots export \
-  -u snapshot-demo \
-  -f now-1h -t now \
-  -n 260604-190102-istio-ingressgateway-baseline-suite \
-  -o /reports/devops-gs
+  -u <dashboard-uid> \
+  -f now-1h \
+  -t now \
+  -n <snapshot-name> \
+  -o /reports/<subdir>
 
-# Restore every *.json in a folder into Grafana
-grafana-snapshots import -d /reports/devops-gs
+grafana-snapshots import -d /reports/<subdir>
 ```
 
-Environment (optional): `GRAFANA_URL`, `GRAFANA_USER`, `GRAFANA_PASSWORD` (defaults: `http://host.docker.internal:3000`, admin/admin).
+| Item | Meaning |
+|------|---------|
+| `-u` | Dashboard UID |
+| `-f` / `-t` | Time range |
+| `-n` | Snapshot name (Grafana title + `<name>.json`) |
+| `-o` | Path under `/reports` in the container → `./reports/<subdir>/` on the host |
 
-## Local run
-
-```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-
-export GRAFANA_URL=http://localhost:3000
-python cli/snapshot_publish.py export -u snapshot-demo -n my-run -o .
-```
-
-## Export flow
-
-1. Open dashboard (`-u`, `-f`, `-t`)
-2. Expand collapsed rows, wait for panels to finish loading
-3. Publish snapshot via Grafana UI (Playwright)
-4. Fail if snapshot has no embedded data (No data)
-5. Save `<name>.json` and register snapshot in Grafana under `-n`
-
-## Examples
-
-- `examples/kubernetes/` — minimal Prometheus + Grafana 12.3 for local testing
-- `examples/dashboards/` — demo dashboard (`uid: snapshot-demo`)
+Grafana chart/env: `GF_SERVER_ROOT_URL=%(protocol)s://%(domain)s:%(http_port)s/`
 
 ## License
 
 Apache 2.0 — see [LICENSE](LICENSE).
-# grafana-snapshot-cli

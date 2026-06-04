@@ -1,21 +1,9 @@
-# Manual Grafana snapshot CLI.
-#
-#   export GRAFANA_REPORTS_DIR=~/path/to/grafana_reports
-#   docker compose build
-#   alias grafana-snapshots='docker compose -f /path/to/grafana-snapshot-cli/docker-compose.yaml run --rm snapshot'
-#
-#   grafana-snapshots export -u snapshot-demo -f now-1h -t now -n my-run -o /reports/devops-gs
-#   grafana-snapshots import -d /reports/devops-gs
 services:
-  snapshot:
-    build: .
-    image: grafana-snapshot:latest
+  grafana-snapshots:
+    image: grafana-snapshots:v0.1.0
     environment:
-      GRAFANA_URL: ${GRAFANA_URL:-http://host.docker.internal:3000}
-      GRAFANA_USER: ${GRAFANA_USER:-admin}
-      GRAFANA_PASSWORD: ${GRAFANA_PASSWORD:-admin}
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+      GRAFANA_URL: http://host.docker.internal:3000
+      GRAFANA_USER: admin
+      GRAFANA_PASSWORD: admin
     volumes:
-      - ${GRAFANA_REPORTS_DIR:-${PWD}}:/reports
-    working_dir: /reports
+      - ./reports:/reports
